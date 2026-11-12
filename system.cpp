@@ -110,9 +110,21 @@ clock_t MonoClock()
 }
 
 
+#ifdef _UNIX
+extern volatile sig_atomic_t UnrarInterruptSignal;
+#endif
+
 
 void Wait()
 {
+#ifdef _UNIX
+  if (UnrarInterruptSignal != 0)
+  {
+    ErrHandler.UserBreak = true;
+    ErrHandler.SetDisableShutdown();
+    ErrHandler.Exit(RARX_USERBREAK);
+  }
+#endif
   if (ErrHandler.UserBreak)
     ErrHandler.Exit(RARX_USERBREAK);
 #if defined(_WIN_ALL) && !defined(SFX_MODULE)

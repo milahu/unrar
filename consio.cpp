@@ -761,12 +761,20 @@ static void GetPasswordText(std::wstring &Str)
     }
     #elif true
     // handle Ctrl+C on password prompt
+    // yes, this works
     PasswordResult Result = ReadPasswordTTY3(StrA.data(), StrA.size());
+    if (Result == PasswordResult::Interrupted)
+    {
+      cleandata(StrA.data(), StrA.size());
+      // This will handle the existing signal flag.
+      Wait();
+      // A literal 0x03 does not necessarily generate SIGINT,
+      // so handle that case explicitly.
+      ErrHandler.Exit(RARX_USERBREAK);
+    }
     if (Result != PasswordResult::Success)
     {
       cleandata(StrA.data(), StrA.size());
-      if (Result == PasswordResult::Interrupted)
-        ErrHandler.Exit(RARX_USERBREAK);
       ErrHandler.Exit(RARX_FATAL);
     }
     #endif

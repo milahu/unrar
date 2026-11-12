@@ -272,6 +272,11 @@ void ErrorHandler::SetErrorCode(RAR_EXIT Code)
 }
 
 
+#ifdef _UNIX
+volatile sig_atomic_t UnrarInterruptSignal = 0;
+#endif
+
+
 #ifdef _WIN_ALL
 BOOL __stdcall ProcessSignal(DWORD SigType)
 #else
@@ -302,14 +307,22 @@ void _stdfunction ProcessSignal(int SigType)
   exit(RARX_USERBREAK);
 #endif
 
+// #ifdef _UNIX
+//   static uint BreakCount=0;
+//   // User continues to press Ctrl+C, exit immediately without cleanup.
+//   if (++BreakCount>1)
+//     exit(RARX_USERBREAK);
+//   // Otherwise return from signal handler and let Wait() function to close
+//   // files and quit. We cannot use the same approach as in Windows,
+//   // because Unix signal handler can block execution of our main code.
+// #endif
+
 #ifdef _UNIX
-  static uint BreakCount=0;
-  // User continues to press Ctrl+C, exit immediately without cleanup.
-  if (++BreakCount>1)
-    exit(RARX_USERBREAK);
-  // Otherwise return from signal handler and let Wait() function to close
-  // files and quit. We cannot use the same approach as in Windows,
-  // because Unix signal handler can block execution of our main code.
+  if (SigType == SIGINT || SigType == SIGTERM)
+  {
+    UnrarInterruptSignal = SigType;
+    return;
+  }
 #endif
 
 #if defined(_WIN_ALL) && !defined(_MSC_VER)
