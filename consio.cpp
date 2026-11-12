@@ -5,6 +5,9 @@
 #include <termios.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <errno.h>
+#include <string.h>
 
 static MESSAGE_TYPE MsgStream=MSG_STDOUT;
 static RAR_CHARSET RedirectCharset=RCH_DEFAULT;
@@ -167,6 +170,169 @@ static void QuitIfInputProhibited()
 }
 
 
+
+#ifndef _WIN_ALL
+#ifndef __VMS
+
+// This is a POSIX implementation intended for Linux and other Unix-like systems.
+// It deliberately forces termination on Ctrl+C,
+// including when the previous SIGINT disposition was SIG_IGN.
+
+static volatile sig_atomic_t PasswordInterrupted = 0;
+
+static void PasswordSigInt(int)
+{
+  PasswordInterrupted = 1;
+}
+
+// Read password from /dev/tty without echo.
+// Return false on error. Ctrl+C terminates via SIGINT.
+static bool ReadPasswordTTY(char *Buf, size_t Size)
+{
+  if (Size == 0)
+    return false;
+
+  Buf[0] = 0;
+
+  int Fd = open("/dev/tty", O_RDWR);
+  if (Fd < 0)
+    return false;
+
+  struct termios OldTerm, NewTerm;
+  if (tcgetattr(Fd, &OldTerm) != 0)
+  {
+    close(Fd);
+    return false;
+  }
+
+  // Disable echo, enable signal processing and
+  // canonical (line-based) input.
+  NewTerm = OldTerm;
+  NewTerm.c_lflag &= ~ECHO;
+  NewTerm.c_lflag |= ISIG | ICANON;
+
+  // Restore a usable Ctrl+C interrupt character
+  // if the terminal has disabled it.
+  if (NewTerm.c_cc[VINTR] == _POSIX_VDISABLE)
+    NewTerm.c_cc[VINTR] = 3;
+
+  struct sigaction OldAction, NewAction;
+  memset(&NewAction, 0, sizeof(NewAction));
+  NewAction.sa_handler = PasswordSigInt;
+  sigemptyset(&NewAction.sa_mask);
+  NewAction.sa_flags = 0; // No SA_RESTART.
+
+  PasswordInterrupted = 0;
+
+  if (sigaction(SIGINT, &NewAction, &OldAction) != 0)
+  {
+    close(Fd);
+    return false;
+  }
+
+  bool TermChanged = false;
+  bool Success = false;
+  size_t Pos = 0;
+
+  if (tcsetattr(Fd, TCSAFLUSH, &NewTerm) == 0)
+  {
+    TermChanged = true;
+
+    // Read until newline, EOF, error or Ctrl+C.
+    // Read one byte at a time to recognize literal
+    // interrupt bytes even in unusual PTY setups.
+    while (!PasswordInterrupted)
+    {
+      char Ch;
+      ssize_t N = read(Fd, &Ch, 1);
+
+      if (N < 0)
+      {
+        if (errno == EINTR)
+        {
+          if (PasswordInterrupted)
+            break;
+          continue;
+        }
+        break;
+      }
+
+      if (N == 0)
+        break;
+
+      // Fallback: Ctrl+C delivered as an input byte.
+      // Normally ISIG causes SIGINT instead.
+      if ((unsigned char)Ch ==
+          (unsigned char)NewTerm.c_cc[VINTR])
+      {
+        PasswordInterrupted = 1;
+        break;
+      }
+
+      // Also recognize literal ASCII Ctrl+C when
+      // VINTR has been remapped.
+      if ((unsigned char)Ch == 3)
+      {
+        PasswordInterrupted = 1;
+        break;
+      }
+
+      if (Ch == '\n' || Ch == '\r')
+      {
+        Success = true;
+        break;
+      }
+
+      // Do not truncate silently. Continue consuming
+      // the line, but report failure if too long.
+      if (Pos + 1 < Size)
+        Buf[Pos++] = Ch;
+      else
+        Success = false;
+    }
+  }
+
+  Buf[Pos] = 0;
+
+  // Restore terminal settings before terminating.
+  if (TermChanged)
+    tcsetattr(Fd, TCSAFLUSH, &OldTerm);
+
+  close(Fd);
+
+  if (PasswordInterrupted)
+  {
+    // Erase the partial password.
+    memset(Buf, 0, Size);
+
+    // Restore normal SIGINT behavior, ensuring
+    // Ctrl+C terminates even if previously ignored.
+    struct sigaction DefaultAction;
+    memset(&DefaultAction, 0, sizeof(DefaultAction));
+    DefaultAction.sa_handler = SIG_DFL;
+    sigemptyset(&DefaultAction.sa_mask);
+    sigaction(SIGINT, &DefaultAction, NULL);
+
+    // Ensure SIGINT is unblocked before raising it.
+    sigset_t Set;
+    sigemptyset(&Set);
+    sigaddset(&Set, SIGINT);
+    sigprocmask(SIG_UNBLOCK, &Set, NULL);
+
+    raise(SIGINT);
+    _exit(130);
+  }
+
+  sigaction(SIGINT, &OldAction, NULL);
+
+  return Success;
+}
+
+#endif
+#endif
+
+
+
 static void GetPasswordText(std::wstring &Str)
 {
   QuitIfInputProhibited();
@@ -211,7 +377,7 @@ static void GetPasswordText(std::wstring &Str)
     #if false
     // ignore Ctrl+C on password prompt
     strncpyz(StrA.data(),getpass(""),StrA.size());
-    #else
+    #elif false
     // handle Ctrl+C on password prompt
     // no, this is not working
     // 2. Minimal source-code fix
@@ -229,6 +395,15 @@ static void GetPasswordText(std::wstring &Str)
       close(tty);
     }
     strncpyz(StrA.data(),getpass(""),StrA.size());
+    #elif true
+    // handle Ctrl+C on password prompt
+    // yes, this works, "but it is not a fully race-free production implementation"
+    // 3. Better fix: ensure the password reader preserves ISIG
+    if (!ReadPasswordTTY(StrA.data(),StrA.size()))
+    {
+      cleandata(StrA.data(),StrA.size());
+      ErrHandler.Exit(RARX_USERBREAK);
+    }
     #endif
 #endif
     CharToWide(StrA.data(),Str);
