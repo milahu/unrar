@@ -1,6 +1,11 @@
 #include "rar.hpp"
 #include "log.cpp"
 
+// FIXME unix only
+#include <termios.h>
+#include <unistd.h>
+#include <fcntl.h>
+
 static MESSAGE_TYPE MsgStream=MSG_STDOUT;
 static RAR_CHARSET RedirectCharset=RCH_DEFAULT;
 static bool ProhibitInput=false;
@@ -203,7 +208,28 @@ static void GetPasswordText(std::wstring &Str)
 #elif defined(__sun)
     strncpyz(StrA.data(),getpassphrase(""),StrA.size());
 #else
+    #if false
+    // ignore Ctrl+C on password prompt
     strncpyz(StrA.data(),getpass(""),StrA.size());
+    #else
+    // handle Ctrl+C on password prompt
+    // no, this is not working
+    // 2. Minimal source-code fix
+    int tty = open("/dev/tty", O_RDONLY);
+    if (tty >= 0)
+    {
+      struct termios original, modified;
+      if (tcgetattr(tty, &original) == 0)
+      {
+        modified = original;
+        modified.c_lflag |= ISIG;
+        // Enable Ctrl+C interrupt processing.
+        tcsetattr(tty, TCSANOW, &modified);
+      }
+      close(tty);
+    }
+    strncpyz(StrA.data(),getpass(""),StrA.size());
+    #endif
 #endif
     CharToWide(StrA.data(),Str);
     cleandata(StrA.data(),StrA.size()*sizeof(StrA[0]));
