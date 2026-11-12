@@ -491,6 +491,195 @@ static bool ReadPasswordTTY2(char *Buf, size_t Size)
 
 
 
+#ifndef _WIN_ALL
+#ifndef __VMS
+
+#include <termios.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/select.h>
+#include <errno.h>
+#include <string.h>
+
+extern volatile sig_atomic_t UnrarInterruptSignal;
+
+enum class PasswordResult
+{
+  Success,
+  Interrupted,
+  Error
+};
+
+static PasswordResult ReadPasswordTTY3(char *Buf, size_t Size)
+{
+  if (Size == 0)
+    return PasswordResult::Error;
+
+  Buf[0] = 0;
+
+  // Block SIGINT and SIGTERM before touching terminal state.
+  sigset_t BlockSet, OldMask, WaitMask;
+  sigemptyset(&BlockSet);
+  sigaddset(&BlockSet, SIGINT);
+  sigaddset(&BlockSet, SIGTERM);
+
+  if (sigprocmask(SIG_BLOCK, &BlockSet, &OldMask) != 0)
+    return PasswordResult::Error;
+
+  // Unblock SIGINT/SIGTERM only while inside pselect().
+  WaitMask = OldMask;
+  sigdelset(&WaitMask, SIGINT);
+  sigdelset(&WaitMask, SIGTERM);
+
+  PasswordResult Result = PasswordResult::Error;
+
+  int Fd = -1;
+  struct termios OldTerm, NewTerm;
+  bool TermChanged = false;
+  bool Overflow = false;
+  size_t Pos = 0;
+
+  if (UnrarInterruptSignal != 0)
+  {
+    Result = PasswordResult::Interrupted;
+    goto Cleanup;
+  }
+
+  Fd = open("/dev/tty", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+  if (Fd < 0)
+    goto Cleanup;
+
+  if (tcgetattr(Fd, &OldTerm) != 0)
+    goto Cleanup;
+
+  NewTerm = OldTerm;
+
+  // Noncanonical, no echo, but preserve signal generation.
+  NewTerm.c_lflag &= ~(ECHO | ICANON);
+  NewTerm.c_lflag |= ISIG;
+
+  NewTerm.c_cc[VMIN] = 1;
+  NewTerm.c_cc[VTIME] = 0;
+
+  if (tcsetattr(Fd, TCSAFLUSH, &NewTerm) != 0)
+    goto Cleanup;
+
+  TermChanged = true;
+
+  for (;;)
+  {
+    if (UnrarInterruptSignal != 0)
+    {
+      Result = PasswordResult::Interrupted;
+      break;
+    }
+
+    fd_set ReadSet;
+    FD_ZERO(&ReadSet);
+    FD_SET(Fd, &ReadSet);
+
+    // Atomic unblock-and-wait.
+    int Ready = pselect(Fd + 1, &ReadSet, NULL, NULL,
+                        NULL, &WaitMask);
+
+    if (UnrarInterruptSignal != 0)
+    {
+      Result = PasswordResult::Interrupted;
+      break;
+    }
+
+    if (Ready < 0)
+    {
+      if (errno == EINTR)
+        continue;
+
+      Result = PasswordResult::Error;
+      break;
+    }
+
+    if (Ready == 0)
+      continue;
+
+    // Nonblocking read eliminates readiness/read blocking races.
+    char Ch;
+    ssize_t N = read(Fd, &Ch, 1);
+
+    if (N < 0)
+    {
+      if (errno == EINTR ||
+          errno == EAGAIN ||
+          errno == EWOULDBLOCK)
+        continue;
+
+      Result = PasswordResult::Error;
+      break;
+    }
+
+    if (N == 0)
+    {
+      Result = PasswordResult::Error;
+      break;
+    }
+
+    unsigned char C = (unsigned char)Ch;
+
+    // Handle raw Ctrl+C bytes delivered by unusual PTYs.
+    if (C == 3 ||
+        (NewTerm.c_cc[VINTR] != _POSIX_VDISABLE &&
+         C == (unsigned char)NewTerm.c_cc[VINTR]))
+    {
+      Result = PasswordResult::Interrupted;
+      break;
+    }
+
+    if (Ch == '\n' || Ch == '\r')
+    {
+      Result = Overflow ?
+        PasswordResult::Error : PasswordResult::Success;
+      break;
+    }
+
+    if (Pos + 1 < Size)
+      Buf[Pos++] = Ch;
+    else
+      Overflow = true;
+  }
+
+Cleanup:
+  if (Buf != NULL)
+    Buf[Pos] = 0;
+
+  // Signals remain blocked during terminal restoration.
+  if (TermChanged)
+  {
+    if (tcsetattr(Fd, TCSANOW, &OldTerm) != 0)
+      Result = PasswordResult::Error;
+  }
+
+  if (Fd >= 0)
+    close(Fd);
+
+  if (UnrarInterruptSignal != 0)
+    Result = PasswordResult::Interrupted;
+
+  if (Result != PasswordResult::Success)
+    cleandata(Buf, Size);
+
+  // Restore original signal mask only after terminal cleanup.
+  if (sigprocmask(SIG_SETMASK, &OldMask, NULL) != 0)
+    return PasswordResult::Error;
+
+  return Result;
+}
+
+#endif
+#endif
+
+
+
+
+
 static void GetPasswordText(std::wstring &Str)
 {
   QuitIfInputProhibited();
@@ -562,13 +751,23 @@ static void GetPasswordText(std::wstring &Str)
       cleandata(StrA.data(),StrA.size());
       ErrHandler.Exit(RARX_USERBREAK);
     }
-    #elif true
+    #elif false
     // handle Ctrl+C on password prompt
     // yes, this works
     if (!ReadPasswordTTY2(StrA.data(),StrA.size()))
     {
       cleandata(StrA.data(),StrA.size());
       ErrHandler.Exit(RARX_USERBREAK);
+    }
+    #elif true
+    // handle Ctrl+C on password prompt
+    PasswordResult Result = ReadPasswordTTY3(StrA.data(), StrA.size());
+    if (Result != PasswordResult::Success)
+    {
+      cleandata(StrA.data(), StrA.size());
+      if (Result == PasswordResult::Interrupted)
+        ErrHandler.Exit(RARX_USERBREAK);
+      ErrHandler.Exit(RARX_FATAL);
     }
     #endif
 #endif
