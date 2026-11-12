@@ -332,6 +332,164 @@ static bool ReadPasswordTTY(char *Buf, size_t Size)
 #endif
 
 
+#ifndef _WIN_ALL
+#ifndef __VMS
+
+#include <termios.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/select.h>
+#include <errno.h>
+
+static bool ReadPasswordTTY2(char *Buf, size_t Size)
+{
+  if (Size == 0)
+    return false;
+
+  Buf[0] = 0;
+
+  // The descriptor is nonblocking, so a read() cannot become stuck if the input disappears between pselect() and read().
+  int Fd = open("/dev/tty", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+  if (Fd < 0)
+    return false;
+
+  struct termios OldTerm, NewTerm;
+  if (tcgetattr(Fd, &OldTerm) != 0)
+  {
+    close(Fd);
+    return false;
+  }
+
+  // Block SIGINT while modifying terminal state.
+  sigset_t BlockSet, OldMask, WaitMask;
+  sigemptyset(&BlockSet);
+  sigaddset(&BlockSet, SIGINT);
+
+  if (sigprocmask(SIG_BLOCK, &BlockSet, &OldMask) != 0)
+  {
+    close(Fd);
+    return false;
+  }
+
+  // pselect temporarily restores the original mask,
+  // allowing UnRAR's ProcessSignal() to run.
+  WaitMask = OldMask;
+
+  NewTerm = OldTerm;
+  NewTerm.c_lflag &= ~(ECHO | ICANON);
+  NewTerm.c_lflag |= ISIG;
+  NewTerm.c_cc[VMIN] = 1;
+  NewTerm.c_cc[VTIME] = 0;
+
+  // Preserve the configured interrupt character.
+  // Literal 0x03 is handled separately below.
+
+  bool TermChanged = false;
+  bool Success = false;
+  bool Overflow = false;
+  bool Interrupted = false;
+  size_t Pos = 0;
+
+  if (tcsetattr(Fd, TCSAFLUSH, &NewTerm) == 0)
+  {
+    TermChanged = true;
+
+    while (!ErrHandler.UserBreak)
+    {
+      fd_set ReadSet;
+      FD_ZERO(&ReadSet);
+      FD_SET(Fd, &ReadSet);
+
+      // Atomically wait for input while temporarily unblocking SIGINT.
+      // pselect() atomically unblocks SIGINT while waiting. Once it returns, SIGINT is blocked again.
+      int Ready = pselect(Fd + 1, &ReadSet, NULL, NULL,
+                          NULL, &WaitMask);
+
+      if (ErrHandler.UserBreak)
+        break;
+
+      if (Ready < 0)
+      {
+        if (errno == EINTR)
+          continue;
+        break;
+      }
+
+      // SIGINT is blocked again here.
+      // O_NONBLOCK prevents a read() race.
+      char Ch;
+      ssize_t N = read(Fd, &Ch, 1);
+
+      if (N < 0)
+      {
+        if (errno == EINTR || errno == EAGAIN)
+          continue;
+        break;
+      }
+
+      if (N == 0)
+        break;
+
+      unsigned char C = (unsigned char)Ch;
+
+      // Some PTYs deliver Ctrl+C as literal 0x03
+      // rather than generating SIGINT.
+      if (C == 3 ||
+          (NewTerm.c_cc[VINTR] != _POSIX_VDISABLE &&
+           C == (unsigned char)NewTerm.c_cc[VINTR]))
+      {
+        Interrupted = true;
+        break;
+      }
+
+      if (Ch == '\n' || Ch == '\r')
+      {
+        Success = !Overflow;
+        break;
+      }
+
+      if (Pos + 1 < Size)
+        Buf[Pos++] = Ch;
+      else
+        Overflow = true;
+    }
+  }
+
+  if (ErrHandler.UserBreak)
+    Interrupted = true;
+
+  Buf[Pos] = 0;
+
+  // SIGINT remains blocked during terminal restoration.
+  bool Restored = true;
+  if (TermChanged)
+    Restored = tcsetattr(Fd, TCSAFLUSH, &OldTerm) == 0;
+
+  close(Fd);
+
+  if (Interrupted || !Restored)
+  {
+    // Clear the partial password.
+    cleandata(Buf, Size);
+    Success = false;
+  }
+
+  // Restore the original signal mask only after
+  // terminal restoration.
+  sigprocmask(SIG_SETMASK, &OldMask, NULL);
+
+  if (Interrupted)
+    ErrHandler.Exit(RARX_USERBREAK);
+
+  return Success && Restored;
+}
+
+#endif
+#endif
+
+
+
 
 static void GetPasswordText(std::wstring &Str)
 {
@@ -395,11 +553,19 @@ static void GetPasswordText(std::wstring &Str)
       close(tty);
     }
     strncpyz(StrA.data(),getpass(""),StrA.size());
-    #elif true
+    #elif false
     // handle Ctrl+C on password prompt
     // yes, this works, "but it is not a fully race-free production implementation"
     // 3. Better fix: ensure the password reader preserves ISIG
     if (!ReadPasswordTTY(StrA.data(),StrA.size()))
+    {
+      cleandata(StrA.data(),StrA.size());
+      ErrHandler.Exit(RARX_USERBREAK);
+    }
+    #elif true
+    // handle Ctrl+C on password prompt
+    // yes, this works
+    if (!ReadPasswordTTY2(StrA.data(),StrA.size()))
     {
       cleandata(StrA.data(),StrA.size());
       ErrHandler.Exit(RARX_USERBREAK);
