@@ -678,6 +678,99 @@ Cleanup:
 
 
 
+#ifndef _WIN_ALL
+#ifndef __VMS
+
+#include <termios.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/select.h>
+#include <errno.h>
+#include <string.h>
+
+// Date: Thu, 19 Nov 2026 20:26:51 +0500
+// From: Eugene Roshal <roshal@rarlab.com>
+// Message-ID: <1027381986.20261119202651@rarlab.com>
+// To: milahu@milahu.duckdns.org
+// Subject: Re: Fwd: fix the password prompt on unix
+//
+// Hello,
+// Thank you for contacting us about this issue.
+// Now I've replaced the old getpass() code with termios.h based
+// and uploaded a newer build of 7.30 beta 2 to www.rarlab.com
+// Below is the code I've used:
+// ...
+// Eugene
+
+static volatile sig_atomic_t GotPasswordSignal = 0;
+
+static void PasswordSignal(int sig)
+{
+  GotPasswordSignal=sig;
+}
+
+// Reads a password from /dev/tty with echo disabled.
+// Returns true on success, false on error or signal interruption.
+static bool ReadPasswordTty(char *buf,size_t buflen)
+{
+  int fd=open("/dev/tty",O_RDWR|O_NOCTTY);
+  if (fd==-1)
+    return false;
+
+  termios old_tio;
+  if (tcgetattr(fd,&old_tio)!=0)
+  {
+    close(fd);
+    return false;
+  }
+
+  struct sigaction sa{}, old_int, old_term;
+  sa.sa_handler=PasswordSignal;
+  sigemptyset(&sa.sa_mask);
+
+  GotPasswordSignal=0;
+  sigaction(SIGINT,&sa,&old_int); // Install signal handlers.
+  sigaction(SIGTERM,&sa,&old_term);
+
+  termios new_tio;
+  new_tio=old_tio;
+  new_tio.c_lflag &= ~(ECHO|ECHONL); // Disable echo.
+
+  size_t pos=0;
+  if (tcsetattr(fd,TCSANOW,&new_tio)==0)
+  {
+    char ch;
+    ssize_t n;
+
+    // Reading by a single character is more reliable that reading the entire
+    // buffer at once for pipes or non-canonical terminals without ICANON,
+    // which might return string in parts.
+    while ((n=read(fd,&ch,1))==1 && pos+1<buflen && ch!='\n' && ch!='\r')
+      buf[pos++] = ch;
+
+    cleandata(&ch,sizeof(ch));
+    tcsetattr(fd,TCSANOW,&old_tio); // Restore terminal attributes.
+  }
+
+  sigaction(SIGINT,&old_int,NULL); // Restore original signal handlers.
+  sigaction(SIGTERM,&old_term,NULL);
+  close(fd);
+
+  if (GotPasswordSignal) // Ctrl+C pressed.
+  {
+    cleandata(buf,buflen);
+    raise(GotPasswordSignal); // Rethrow the signal.
+    return false;
+  }
+
+  buf[pos]=0;
+  return true;
+}
+
+#endif
+#endif
+
 
 
 static void GetPasswordText(std::wstring &Str)
@@ -759,7 +852,7 @@ static void GetPasswordText(std::wstring &Str)
       cleandata(StrA.data(),StrA.size());
       ErrHandler.Exit(RARX_USERBREAK);
     }
-    #elif true
+    #elif false
     // handle Ctrl+C on password prompt
     // yes, this works
     PasswordResult Result = ReadPasswordTTY3(StrA.data(), StrA.size());
@@ -776,6 +869,15 @@ static void GetPasswordText(std::wstring &Str)
     {
       cleandata(StrA.data(), StrA.size());
       ErrHandler.Exit(RARX_FATAL);
+    }
+    #elif true
+    // handle Ctrl+C on password prompt
+    // yes, this works
+    if (!ReadPasswordTty(StrA.data(),StrA.size()))
+    {
+      // no, `cleandata(buf,buflen);` is already called in ReadPasswordTty
+      // cleandata(StrA.data(),StrA.size());
+      ErrHandler.Exit(RARX_USERBREAK);
     }
     #endif
 #endif
